@@ -10,17 +10,14 @@ class Emphasis:
 
 
 class TextEngine:
-    def __init__(self, z_shape, multiplier_shape, replace_emphasis=False):
+    def __init__(self, z_shape, multiplier_shape):
         self.emphasis = Emphasis()
         self.z_shape = z_shape
         self.multiplier_shape = multiplier_shape
-        self.replace_emphasis = replace_emphasis
         self.images = None
 
     def __call__(self, prompts, images):
         self.images = images
-        if self.replace_emphasis:
-            self.emphasis = Emphasis()
         self.emphasis.z = torch.ones(self.z_shape)
         self.emphasis.multipliers = torch.ones(self.multiplier_shape)
         self.emphasis.after_transformers()
@@ -28,14 +25,14 @@ class TextEngine:
 
 
 def test_grounding_skips_only_incompatible_image_token_emphasis_and_restores_hook():
-    engine = TextEngine((1, 521, 8), (1, 18), replace_emphasis=True)
-    original = Emphasis.after_transformers
+    engine = TextEngine((1, 521, 8), (1, 18))
+    original = engine.emphasis.after_transformers
 
     output = _run_grounded(engine, ["prompt"], ["reference"])
 
     assert output.shape == (1, 521, 8)
     assert engine.images == ["reference"]
-    assert Emphasis.after_transformers is original
+    assert engine.emphasis.after_transformers == original
 
 
 def test_grounding_retains_normal_prompt_emphasis():

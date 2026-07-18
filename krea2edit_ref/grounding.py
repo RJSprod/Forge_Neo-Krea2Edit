@@ -31,17 +31,16 @@ def _run_grounded(text_engine, prompts, images):
     is the safe fallback when that specific mismatch occurs.
     """
     emphasis = getattr(text_engine, "emphasis", None)
-    emphasis_type = type(emphasis) if emphasis is not None else None
-    original_after_transformers = getattr(emphasis_type, "after_transformers", None)
+    original_after_transformers = getattr(emphasis, "after_transformers", None)
     if not callable(original_after_transformers):
         return text_engine(prompts, images=images)
 
-    def after_transformers(current_emphasis):
+    def after_transformers():
         try:
-            return original_after_transformers(current_emphasis)
+            return original_after_transformers()
         except RuntimeError:
-            z = getattr(current_emphasis, "z", None)
-            multipliers = getattr(current_emphasis, "multipliers", None)
+            z = getattr(emphasis, "z", None)
+            multipliers = getattr(emphasis, "multipliers", None)
             if not isinstance(z, torch.Tensor) or not isinstance(multipliers, torch.Tensor):
                 raise
             if z.ndim != multipliers.ndim + 1 or z.shape[:-1] == multipliers.shape:
@@ -52,11 +51,8 @@ def _run_grounded(text_engine, prompts, images):
             )
             return None
 
-    # qwen3vl_engine replaces ``self.emphasis`` while processing tokens. Patch
-    # its class, rather than the current instance, so the newly-created object
-    # receives the scoped compatibility hook too.
-    emphasis_type.after_transformers = after_transformers
+    emphasis.after_transformers = after_transformers
     try:
         return text_engine(prompts, images=images)
     finally:
-        emphasis_type.after_transformers = original_after_transformers
+        emphasis.after_transformers = original_after_transformers
