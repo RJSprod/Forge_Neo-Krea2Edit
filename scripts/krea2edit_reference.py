@@ -2,6 +2,7 @@
 import logging
 import gradio as gr
 from modules import scripts
+from krea2edit_ref.attention_compat import install_qwen_attention_factory_compatibility
 from krea2edit_ref.compatibility import require_krea_engine
 from krea2edit_ref.grounding import install_grounded_conditioning
 from krea2edit_ref.image_prep import extract_gallery, image_hash, grounding_tensor
@@ -70,6 +71,7 @@ class Krea2EditReferenceScript(scripts.Script):
             engine = p.sd_model; dm = require_krea_engine(engine)
             state.model_identity = (id(engine), id(engine.forge_objects.unet), id(dm))
             state.grounding_images = [grounding_tensor(image, state.grounding_px) for image in state.raw_references]
+            install_qwen_attention_factory_compatibility(engine, state)
             install_grounded_conditioning(engine, state); install_edit_forward(dm, engine, state); state.installed = True
             if hasattr(p, "clear_prompt_cache"): p.clear_prompt_cache()
             log.info("%s patches installed", PREFIX)

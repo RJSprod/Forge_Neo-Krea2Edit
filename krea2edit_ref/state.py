@@ -21,6 +21,8 @@ class Krea2EditJobState:
     latent_cache: dict[tuple, Any] = field(default_factory=dict)
     original_get_learned_conditioning: Any = None
     original_diffusion_forward: Any = None
+    attention_function_globals: dict[str, Any] | None = None
+    original_attention_function: Any = None
     engine_ref: Any = None
     diffusion_model_ref: Any = None
     installed: bool = False
@@ -40,12 +42,17 @@ def cleanup_state(state: Krea2EditJobState | None, processing: Any = None) -> No
             model.forward = state.original_diffusion_forward
         if engine is not None and owned_by(getattr(engine, "get_learned_conditioning", None), state.token):
             engine.get_learned_conditioning = state.original_get_learned_conditioning
+        attention_globals = state.attention_function_globals
+        if attention_globals is not None and owned_by(attention_globals.get("attention_function"), state.token):
+            attention_globals["attention_function"] = state.original_attention_function
         if model is not None:
             ACTIVE_PATCH_BY_MODEL_ID.pop(id(model), None)
         state.latent_cache.clear(); state.grounding_images.clear()
         allocated = state.tensors_allocated
         state.tensors_allocated = False; state.installed = False
         state.engine_ref = state.diffusion_model_ref = None
+        state.attention_function_globals = None
+        state.original_attention_function = None
     if processing is not None and getattr(processing, "krea2edit_reference_state", None) is state:
         delattr(processing, "krea2edit_reference_state")
     if allocated:
