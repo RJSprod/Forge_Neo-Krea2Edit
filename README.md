@@ -18,6 +18,8 @@ Hires. fix, img2img, inpainting, non-Krea engines, and more than two references 
 
 Place this repository in Forge's `extensions/` directory, then restart Forge. `requirements.txt` intentionally adds no packages.
 
+The extension also adapts Forge Neo releases where Qwen3-VL expects an attention-function factory but Forge exposes the direct PyTorch attention function. This prevents the `attention_pytorch() missing ... 'k', 'v', and 'heads'` error during image grounding; update Forge Neo when possible.
+
 ## Attribution and licenses
 
 The implementation follows the public Krea2Edit recipe and is informed by [ComfyUI-Krea2Edit](https://github.com/lbouaraba/comfyui-krea2edit) (Apache-2.0). Forge Neo is AGPL-3.0; ensure your distribution complies with applicable licenses.
