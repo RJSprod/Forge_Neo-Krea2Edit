@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from krea2edit_ref.grounding import _run_grounded
+from krea2edit_ref.grounding import _run_grounded, install_grounded_conditioning
+from krea2edit_ref.state import Krea2EditJobState, cleanup_state
 
 
 class Emphasis:
@@ -59,3 +60,18 @@ def test_grounding_does_not_hide_unrelated_emphasis_errors():
 
     with pytest.raises(RuntimeError, match="unexpected failure"):
         _run_grounded(BrokenEngine(), ["prompt"], ["reference"])
+
+
+def test_grounding_hook_is_restored_when_forward_installation_never_happens():
+    class Engine:
+        def get_learned_conditioning(self, prompts):
+            return prompts
+
+    engine = Engine()
+    original = engine.get_learned_conditioning
+    state = Krea2EditJobState(True, [], [], "fit", 768, 1, 1)
+
+    install_grounded_conditioning(engine, state)
+    cleanup_state(state)
+
+    assert engine.get_learned_conditioning == original

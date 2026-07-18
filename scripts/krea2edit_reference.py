@@ -63,18 +63,25 @@ class Krea2EditReferenceScript(scripts.Script):
         p.krea2edit_reference_state = state
         p.extra_generation_params.update({"Krea2 Edit Reference": True, "Krea2 Reference Count": len(refs), "Krea2 Reference Geometry": fit_mode, "Krea2 Grounding PX": int(grounding_px), "Krea2 Subject Fidelity": float(ref_boost)})
         if len(refs) == 2: p.extra_generation_params["Krea2 Scene Fidelity"] = float(ref_boost_a)
-        log.info("%s enabled: %s reference(s), %s geometry", PREFIX, len(refs), fit_mode)
+        try:
+            # Conditioning is constructed before after_extra_networks_activate on
+            # Forge Neo, so install its Qwen hook here rather than after LoRAs.
+            engine = p.sd_model; dm = require_krea_engine(engine)
+            state.model_identity = (id(engine), id(engine.forge_objects.unet), id(dm))
+            state.grounding_images = [grounding_tensor(image, state.grounding_px) for image in state.raw_references]
+            install_qwen_attention_factory_compatibility(engine, state)
+            install_grounded_conditioning(engine, state)
+            if hasattr(p, "clear_prompt_cache"): p.clear_prompt_cache()
+            log.info("%s grounding patch installed: %s reference(s), %s geometry", PREFIX, len(refs), fit_mode)
+        except Exception:
+            cleanup_state(state, p); raise
     def after_extra_networks_activate(self, p, *args, **kwargs):
         state = getattr(p, "krea2edit_reference_state", None)
         if state is None or state.installed: return
         try:
             engine = p.sd_model; dm = require_krea_engine(engine)
-            state.model_identity = (id(engine), id(engine.forge_objects.unet), id(dm))
-            state.grounding_images = [grounding_tensor(image, state.grounding_px) for image in state.raw_references]
-            install_qwen_attention_factory_compatibility(engine, state)
-            install_grounded_conditioning(engine, state); install_edit_forward(dm, engine, state); state.installed = True
-            if hasattr(p, "clear_prompt_cache"): p.clear_prompt_cache()
-            log.info("%s patches installed", PREFIX)
+            install_edit_forward(dm, engine, state); state.installed = True
+            log.info("%s diffusion patch installed", PREFIX)
         except Exception:
             cleanup_state(state, p); raise
     def process_before_every_sampling(self, p, *args, **kwargs):

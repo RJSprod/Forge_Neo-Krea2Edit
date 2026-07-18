@@ -1,5 +1,6 @@
 from types import MethodType
 import logging
+import weakref
 import torch
 from .state import OWNER_ATTR
 
@@ -7,6 +8,8 @@ log = logging.getLogger(__name__)
 
 
 def install_grounded_conditioning(engine, state):
+    if state.grounding_installed:
+        return
     original = engine.get_learned_conditioning
     @torch.inference_mode()
     def grounded(self, prompts):
@@ -18,7 +21,9 @@ def install_grounded_conditioning(engine, state):
         return _run_grounded(text_engine, prompts, state.grounding_images)
     setattr(grounded, OWNER_ATTR, state.token)
     state.original_get_learned_conditioning = original
+    state.engine_ref = weakref.ref(engine)
     engine.get_learned_conditioning = MethodType(grounded, engine)
+    state.grounding_installed = True
 
 
 def _run_grounded(text_engine, prompts, images):

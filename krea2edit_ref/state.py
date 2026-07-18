@@ -25,6 +25,7 @@ class Krea2EditJobState:
     original_attention_function: Any = None
     engine_ref: Any = None
     diffusion_model_ref: Any = None
+    grounding_installed: bool = False
     installed: bool = False
     tensors_allocated: bool = False
     model_identity: tuple | None = None
@@ -49,7 +50,7 @@ def cleanup_state(state: Krea2EditJobState | None, processing: Any = None) -> No
             ACTIVE_PATCH_BY_MODEL_ID.pop(id(model), None)
         state.latent_cache.clear(); state.grounding_images.clear()
         allocated = state.tensors_allocated
-        state.tensors_allocated = False; state.installed = False
+        state.tensors_allocated = False; state.grounding_installed = False; state.installed = False
         state.engine_ref = state.diffusion_model_ref = None
         state.attention_function_globals = None
         state.original_attention_function = None
