@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 import logging
 import torch
-import torch.nn.functional as F
+from einops import rearrange
 from .geometry import reference_geometry
 from .image_prep import vae_tensor
 
@@ -88,34 +88,109 @@ def torch_to_pil_resample():
     from PIL import Image
     return Image.Resampling.BICUBIC
 
-def krea2_edit_forward(model, x, timesteps, context, source_latents, transformer_options=None, ref_boost=1., ref_boost_a=1., **kwargs):
+
+def _forge_patch_helpers():
+    """Import Forge helpers only while executing the Forge-only forward path."""
+    from backend.nn.flux import timestep_embedding
+    from backend.utils import pad_to_patch_size
+
+    return timestep_embedding, pad_to_patch_size
+
+
+def _validate_patch_layout(model):
+    patch = getattr(model, "patch", None)
+    if not isinstance(patch, int) or isinstance(patch, bool) or patch <= 0:
+        raise RuntimeError(f"Unsupported Forge Krea patch size: {patch!r}.")
+    expected = model.channels * patch ** 2
+    actual = getattr(model.first, "in_features", None)
+    if actual is not None and actual != expected:
+        raise RuntimeError(
+            "Unsupported Forge Krea patch embedding layout: expected channels * "
+            f"patch^2 ({expected}), but model.first reports {actual}."
+        )
+    linear = getattr(model.last, "linear", None)
+    actual = getattr(linear, "out_features", None)
+    if actual is not None and actual != expected:
+        raise RuntimeError(
+            "Unsupported Forge Krea output patch layout: expected channels * "
+            f"patch^2 ({expected}), but model.last.linear reports {actual}."
+        )
+    return patch, expected
+
+
+def _patchify(model, value, name, pad_to_patch_size):
+    if value.ndim != 4:
+        raise RuntimeError(f"Krea {name} must be BCHW; received {tuple(value.shape)}.")
+    if value.shape[1] != model.channels:
+        raise RuntimeError(
+            f"Krea {name} channel mismatch: model expects {model.channels}, "
+            f"received {value.shape[1]}."
+        )
+    patch, expected_width = _validate_patch_layout(model)
+    padded = pad_to_patch_size(value, (patch, patch))
+    height, width = padded.shape[-2] // patch, padded.shape[-1] // patch
+    patches = rearrange(
+        padded, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch
+    )
+    if patches.shape[-1] != expected_width:
+        raise RuntimeError(
+            f"Krea {name} patch width mismatch: expected {expected_width}, "
+            f"received {patches.shape[-1]}."
+        )
+    return padded, patches, (height, width)
+
+def krea2_edit_forward(model, x, timesteps, context, source_latents,
+                       transformer_options=None, ref_boost=1., ref_boost_a=1.,
+                       fit_mode="fit", **kwargs):
     """Forge Neo Krea forward with clean reference tokens inserted before target tokens."""
     transformer_options = transformer_options or {}
     temporal = x.ndim == 5
     if temporal:
         batch, channels, frames, height, width = x.shape; x = x.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, height, width)
-    invalid_sources = [index + 1 for index, latent in enumerate(source_latents) if latent.ndim != 4]
-    if invalid_sources:
-        raise RuntimeError(f"Krea2Edit expected BCHW reference latents before edit forward; invalid references: {invalid_sources}.")
-    original_h, original_w = x.shape[-2:]; patch = model.patch
-    x = F.pad(x, (0, (-x.shape[-1]) % patch, 0, (-x.shape[-2]) % patch))
-    target_h, target_w = x.shape[-2] // patch, x.shape[-1] // patch
-    target = model.first(x).flatten(2).transpose(1, 2)
-    refs = [model.first(F.pad(lat, (0, (-lat.shape[-1]) % patch, 0, (-lat.shape[-2]) % patch))).flatten(2).transpose(1, 2) for lat in source_latents]
+    timestep_embedding, pad_to_patch_size = _forge_patch_helpers()
+    original_h, original_w = x.shape[-2:]
+    patch, expected_width = _validate_patch_layout(model)
+    x, target_patches, (target_h, target_w) = _patchify(
+        model, x, "target", pad_to_patch_size
+    )
+    target = model.first(target_patches)
+    refs, reference_grids, reference_patches = [], [], []
+    for index, latent in enumerate(source_latents):
+        padded, patches, grid = _patchify(
+            model, latent, f"reference {index + 1}", pad_to_patch_size
+        )
+        del padded
+        reference_patches.append(patches)
+        refs.append(model.first(patches))
+        reference_grids.append(grid)
+    if not getattr(model, "_krea2edit_patch_layout_logged", False):
+        log.info("[Forge Krea2Edit Ref] patch layout: channels=%d patch=%d width=%d", model.channels, patch, expected_width)
+        log.info("[Forge Krea2Edit Ref] target: latent=%s patches=%s tokens=%s", tuple(x.shape), tuple(target_patches.shape), tuple(target.shape))
+        for index, (patches, tokens) in enumerate(zip(reference_patches, refs), 1):
+            log.info("[Forge Krea2Edit Ref] reference %d: patches=%s tokens=%s", index, tuple(patches.shape), tuple(tokens.shape))
+        model._krea2edit_patch_layout_logged = True
     context = model._unpack_context(context.squeeze(1))
-    t = model.tmlp(timesteps); tvec = model.tproj(t)
-    context = model.txtmlp(model.txtfusion(context))
+    timestep_input = timestep_embedding(timesteps, model.tdim).unsqueeze(1).to(target.dtype)
+    t = model.tmlp(timestep_input); tvec = model.tproj(t)
+    context = model.txtmlp(model.txtfusion(context, mask=None, transformer_options=transformer_options))
     sequence = torch.cat([context, *refs, target], dim=1)
     positions = [torch.zeros((x.shape[0], context.shape[1], 3), device=x.device, dtype=torch.long)]
-    for number, tokens in enumerate(refs, 1):
-        side_h = source_latents[number - 1].shape[-2] // patch; side_w = source_latents[number - 1].shape[-1] // patch
-        positions.append(_imgids(x.shape[0], side_h, side_w, number, device=x.device))
+    for number, (side_h, side_w) in enumerate(reference_grids, 1):
+        offset_y = offset_x = 0
+        if fit_mode == "fit":
+            offset_y = max(0, (target_h - side_h) // 2)
+            offset_x = max(0, (target_w - side_w) // 2)
+        positions.append(_imgids_offset(x.shape[0], side_h, side_w, number, offset_y, offset_x, x.device))
     positions.append(_imgids(x.shape[0], target_h, target_w, 0, device=x.device))
     freqs = model.pe_embedder(torch.cat(positions, dim=1))
     boosts = [ref_boost] if len(refs) == 1 else [ref_boost_a, ref_boost]
     mask = build_reference_bias(x.shape[0], context.shape[1], [r.shape[1] for r in refs], target.shape[1], boosts, x.device, target.dtype)
     for block in model.blocks: sequence = block(sequence, tvec, freqs, mask, transformer_options=transformer_options)
-    output = model.last(sequence, t)[:, -target.shape[1]:].transpose(1, 2)
-    output = output.reshape(x.shape[0], model.channels, target_h, target_w).repeat_interleave(patch, -2).repeat_interleave(patch, -1)[..., :original_h, :original_w]
+    target_start = context.shape[1] + sum(ref.shape[1] for ref in refs)
+    target_output = model.last(sequence, t)[:, target_start:target_start + target.shape[1], :]
+    output = rearrange(
+        target_output, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+        h=target_h, w=target_w, ph=patch, pw=patch, c=model.channels,
+    )[..., :original_h, :original_w]
     if temporal: output = output.reshape(batch, frames, model.channels, original_h, original_w).permute(0, 2, 1, 3, 4)
     return output

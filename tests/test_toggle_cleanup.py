@@ -11,6 +11,13 @@ def test_cleanup_is_idempotent():
 
 def test_instance_forward_wrapper_is_replaced_for_the_job_and_restored():
  class WrappedModel:
+  patch = 2
+  channels = 16
+  class first:
+   in_features = 64
+  class last:
+   class linear:
+    out_features = 64
   def forward(self): return "class forward"
 
  model = WrappedModel()
