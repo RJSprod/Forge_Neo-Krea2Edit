@@ -2,7 +2,7 @@ from types import MethodType
 import logging
 import weakref
 import torch
-from .state import OWNER_ATTR
+from .state import OWNER_ATTR, PATCH_LOCK
 
 log = logging.getLogger(__name__)
 
@@ -36,16 +36,20 @@ def _run_grounded(text_engine, prompts, images):
     is the safe fallback when that specific mismatch occurs.
     """
     emphasis = getattr(text_engine, "emphasis", None)
-    original_after_transformers = getattr(emphasis, "after_transformers", None)
+    if emphasis is None:
+        return text_engine(prompts, images=images)
+
+    emphasis_class = type(emphasis)
+    original_after_transformers = getattr(emphasis_class, "after_transformers", None)
     if not callable(original_after_transformers):
         return text_engine(prompts, images=images)
 
-    def after_transformers():
+    def after_transformers(current_emphasis, *args, **kwargs):
         try:
-            return original_after_transformers()
+            return original_after_transformers(current_emphasis, *args, **kwargs)
         except RuntimeError:
-            z = getattr(emphasis, "z", None)
-            multipliers = getattr(emphasis, "multipliers", None)
+            z = getattr(current_emphasis, "z", None)
+            multipliers = getattr(current_emphasis, "multipliers", None)
             if not isinstance(z, torch.Tensor) or not isinstance(multipliers, torch.Tensor):
                 raise
             if z.ndim != multipliers.ndim + 1 or z.shape[:-1] == multipliers.shape:
@@ -56,8 +60,12 @@ def _run_grounded(text_engine, prompts, images):
             )
             return None
 
-    emphasis.after_transformers = after_transformers
-    try:
-        return text_engine(prompts, images=images)
-    finally:
-        emphasis.after_transformers = original_after_transformers
+    # Qwen3VLTextProcessingEngine creates a new emphasis object in every call.
+    # Scope a class-level hook so that replacement instance receives it too.
+    # Keep the patch lock for the call itself: overlapping jobs share this class.
+    with PATCH_LOCK:
+        emphasis_class.after_transformers = after_transformers
+        try:
+            return text_engine(prompts, images=images)
+        finally:
+            emphasis_class.after_transformers = original_after_transformers
