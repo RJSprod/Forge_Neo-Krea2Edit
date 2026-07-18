@@ -1,11 +1,13 @@
 from __future__ import annotations
 import math
+import logging
 import torch
 import torch.nn.functional as F
 from .geometry import reference_geometry
 from .image_prep import vae_tensor
 
 MAX_BIAS_BYTES = 512 * 1024 * 1024
+log = logging.getLogger(__name__)
 
 def _imgids(batch, height, width, frame=0, device=None):
     y, x = torch.meshgrid(torch.arange(height, device=device), torch.arange(width, device=device), indexing="ij")
@@ -28,7 +30,23 @@ def build_reference_bias(batch, text_len, reference_lengths, target_len, boosts,
         ref_start += length
     return bias
 
+def _to_4d(value: torch.Tensor, name: str) -> torch.Tensor:
+    """Convert Forge Krea image/video latents from BCHW or BCTHW to BCHW."""
+    if value.ndim == 4:
+        return value
+    if value.ndim == 5:
+        batch, channels, frames, height, width = value.shape
+        # Preserve batch/frame ordering when adapting temporal VAE output.
+        return value.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, height, width)
+    raise RuntimeError(
+        f"Krea2Edit expected {name} to be BCHW or BCTHW, "
+        f"but received shape {tuple(value.shape)}."
+    )
+
+
 def _prepare_latents(engine, state, target):
+    target = _to_4d(target, "target latent")
+    target_batch = target.shape[0]
     h, w = target.shape[-2:]; identity = state.model_identity
     output = []
     for index, (image, digest) in enumerate(zip(state.raw_references, state.reference_hashes)):
@@ -44,9 +62,26 @@ def _prepare_latents(engine, state, target):
                 else:
                     crop_h = round(source.width / target_ratio); top = (source.height - crop_h) // 2; source = source.crop((0, top, source.width, top + crop_h))
             source = source.resize((g.width, g.height), torch_to_pil_resample())
-            latent = engine.encode_first_stage(vae_tensor(source))
+            raw_latent = engine.encode_first_stage(vae_tensor(source))
+            latent = _to_4d(raw_latent, f"reference latent {index + 1}")
+            log.info(
+                "[Forge Krea2Edit Ref] reference %d latent: VAE shape=%s, normalized shape=%s",
+                index + 1, tuple(raw_latent.shape), tuple(latent.shape),
+            )
             state.latent_cache[key] = latent; state.tensors_allocated = True
-        output.append(latent.to(device=target.device, dtype=target.dtype).expand(target.shape[0], -1, -1, -1))
+        else:
+            # Normalize cache entries created by an older extension version.
+            latent = _to_4d(latent, f"cached reference latent {index + 1}")
+            state.latent_cache[key] = latent
+        latent = latent.to(device=target.device, dtype=target.dtype)
+        if latent.shape[0] == 1 and target_batch > 1:
+            latent = latent.expand(target_batch, *latent.shape[1:])
+        elif latent.shape[0] != target_batch:
+            raise RuntimeError(
+                "Krea2Edit reference batch does not match the target batch: "
+                f"reference={latent.shape[0]}, target={target_batch}."
+            )
+        output.append(latent)
     return output
 
 def torch_to_pil_resample():
@@ -59,6 +94,9 @@ def krea2_edit_forward(model, x, timesteps, context, source_latents, transformer
     temporal = x.ndim == 5
     if temporal:
         batch, channels, frames, height, width = x.shape; x = x.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, height, width)
+    invalid_sources = [index + 1 for index, latent in enumerate(source_latents) if latent.ndim != 4]
+    if invalid_sources:
+        raise RuntimeError(f"Krea2Edit expected BCHW reference latents before edit forward; invalid references: {invalid_sources}.")
     original_h, original_w = x.shape[-2:]; patch = model.patch
     x = F.pad(x, (0, (-x.shape[-1]) % patch, 0, (-x.shape[-2]) % patch))
     target_h, target_w = x.shape[-2] // patch, x.shape[-1] // patch
